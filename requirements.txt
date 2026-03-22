@@ -1,0 +1,78 @@
+# =============================================================================
+#  requirements.txt  –  STT + Diarization Demo
+#  Python 3.9+
+# =============================================================================
+#
+# ⚠️  TIÊN QUYẾT HỆ ĐIỀU HÀNH (cài TRƯỚC khi pip install):
+#
+#   ffmpeg  (dùng để chuyển đổi và đo độ dài audio)
+#   ─────────────────────────────────────────────────
+#   Ubuntu/Debian  : sudo apt update && sudo apt install -y ffmpeg
+#   macOS (Homebrew): brew install ffmpeg
+#   Windows        : https://ffmpeg.org/download.html
+#                    → Giải nén, thêm thư mục bin/ vào biến PATH
+#
+#   Kiểm tra: ffmpeg -version  &&  ffprobe -version
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️  HUGGING FACE TOKEN & ĐIỀU KHOẢN SỬ DỤNG (bắt buộc)
+#
+#   1. Đăng nhập / đăng ký tài khoản HuggingFace
+#   2. Tạo "Read" access token tại:
+#        https://hf.co/settings/tokens
+#   3. Vào trang model và bấm "Agree and access repository":
+#        https://huggingface.co/pyannote/speaker-diarization-community-1
+#      Nếu bỏ qua bước này, pipeline sẽ báo lỗi HTTP 403.
+#   4. Cung cấp token khi chạy script:
+#        export HF_TOKEN="hf_xxxxxxxxxxxxxxxxxxxx"
+#      hoặc truyền qua flag:  --hf-token hf_xxx...
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core inference ────────────────────────────────────────────────────────────
+# faster-whisper (CTranslate2 backend – nhanh hơn openai-whisper ~4×)
+faster-whisper
+
+# CTranslate2 runtime (thường được kéo theo faster-whisper, liệt kê tường minh)
+ctranslate2
+
+# ── Speaker diarization ───────────────────────────────────────────────────────
+pyannote.audio
+
+# ── Deep learning framework ───────────────────────────────────────────────────
+torch
+
+# ── Hugging Face Hub (tải model về cache) ─────────────────────────────────────
+huggingface-hub
+
+# ── Audio / signal processing ─────────────────────────────────────────────────
+# soundfile: đọc/ghi WAV không phụ thuộc libsndfile hệ thống
+soundfile
+# noisereduce: khử tiếng ồn nền (spectral gating) trước khi diarization
+# Dùng với flag --denoise khi audio có noise stationary (văn phòng, quán cà phê)
+# hoặc khi 2 giọng gần nhau hay bị nhầm speaker
+# pip install noisereduce
+noisereduce
+
+# librosa: phân tích audio (tuỳ chọn – hữu ích nếu muốn inspect waveform)
+# librosa>=0.10.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+# numpy: đã là transitive dep nhưng pin phiên bản để tránh ABI mismatch
+numpy
+
+# tqdm: thanh tiến trình (được dùng bởi pyannote & faster-whisper internally)
+tqdm
+
+# =============================================================================
+# LỆNH CÀI ĐẶT NHANH (CPU-only, môi trường sạch):
+#
+#   python -m venv .venv
+#   source .venv/bin/activate          # Windows: .venv\Scripts\activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# Kiểm tra cài đặt:
+#   python -c "from faster_whisper import WhisperModel; print('Whisper OK')"
+#   python -c "from pyannote.audio import Pipeline; print('Pyannote OK')"
+# =============================================================================
