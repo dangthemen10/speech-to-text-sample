@@ -1,22 +1,22 @@
-# Architecture — STT + Speaker Diarization Pipeline
+# Kiến trúc — Pipeline STT + Phân tách người nói
 
-## Overview
+## Tổng quan
 
-The pipeline converts any audio/video file into a speaker-labeled transcript
-by running two models in parallel and then merging their outputs.
+Pipeline nhận bất kỳ file audio/video nào và tạo ra bản transcript có gán nhãn người nói,
+bằng cách chạy song song hai model rồi gộp kết quả lại.
 
 ```
-Audio file
+File audio
     │
     ▼
 ┌─────────────────────────────────────┐
-│  ffmpeg: convert to WAV 16kHz mono  │
+│  ffmpeg: chuyển sang WAV 16kHz mono │
 └─────────────────────────────────────┘
     │                    │
-    ▼                    ▼ (if --denoise)
+    ▼                    ▼ (nếu --denoise)
 ┌──────────┐      ┌─────────────┐
-│  original│      │  denoised   │
-│   WAV    │      │    WAV      │
+│  WAV gốc │      │  WAV đã khử │
+│          │      │   tiếng ồn  │
 └──────────┘      └─────────────┘
     │                    │
     ▼                    ▼
@@ -24,15 +24,15 @@ Audio file
 │   WHISPER    │  │    PYANNOTE      │
 │  large-v3    │  │  community-1     │
 │              │  │                  │
-│ word-level   │  │ speaker segments │
-│ timestamps   │  │ + overlap flags  │
+│ timestamps   │  │ speaker segments │
+│ từng từ      │  │ + overlap flags  │
 └──────────────┘  └──────────────────┘
     │                    │
     └──────────┬─────────┘
                ▼
     ┌─────────────────────┐
     │  ALIGNMENT          │
-    │  max-overlap assign │
+    │  gán từ → người nói │
     └─────────────────────┘
                │
                ▼
@@ -44,59 +44,59 @@ Audio file
 
 ---
 
-## Full pipeline flowchart
+## Sơ đồ luồng toàn bộ pipeline
 
 ```mermaid
 flowchart TD
-    INPUT([🎙 Audio / Video file])
+    INPUT([🎙 File Audio / Video đầu vào])
 
-    subgraph PREP ["SECTION 1 — Audio Preparation"]
+    subgraph PREP ["SECTION 1 — Chuẩn bị Audio"]
         CONVERT["convert_audio_to_wav()\nffmpeg → WAV 16kHz mono PCM-16"]
-        PROBE["probe_audio_duration()\nffprobe → duration in seconds"]
-        DENOISE["denoise_wav()\nnoisereduce spectral gating\n⚠ optional, diarize path only"]
+        PROBE["probe_audio_duration()\nffprobe → độ dài tính bằng giây"]
+        DENOISE["denoise_wav()\nnoisereduce spectral gating\n⚠ tuỳ chọn, chỉ cho nhánh diarize"]
     end
 
-    subgraph ASR ["SECTION 2 — Speech-to-Text  (faster-whisper)"]
+    subgraph ASR ["SECTION 2 — Nhận dạng giọng nói  (faster-whisper)"]
         LOAD_W["load_whisper_model()\nlarge-v3, float16/int8"]
-        DURATION_CHECK{duration\n> 30 min?}
-        BATCHED["BatchedInferencePipeline\nbatch_size=16\nVAD: on by default"]
+        DURATION_CHECK{độ dài\n> 30 phút?}
+        BATCHED["BatchedInferencePipeline\nbatch_size=16\nVAD: bật mặc định"]
         STANDARD["WhisperModel.transcribe\nvad_filter=True\nbeam_size=5"]
         WORDS[/"List[WordStamp]\ntext, start_sec, end_sec, confidence"/]
     end
 
-    subgraph DIARIZE ["SECTION 3 — Speaker Diarization  (pyannote community-1)"]
+    subgraph DIARIZE ["SECTION 3 — Phân tách người nói  (pyannote community-1)"]
         LOAD_P["DiarizationPipeline.from_pretrained()\npyannote/speaker-diarization-community-1"]
         TUNE["_apply_hyperparameter_overrides()\nclustering_threshold\nsegmentation_threshold"]
         RUN_P["pipeline(wav_path)\nSpeaker Change Detection ✓\nOverlapped Speech Detection ✓"]
 
         subgraph DIARIZE_OUT ["DiarizeOutput"]
-            FULL_ANN["speaker_diarization\nAnnotation — incl. overlap tracks"]
-            EXCL_ANN["exclusive_speaker_diarization\nAnnotation — 1 speaker / moment"]
+            FULL_ANN["speaker_diarization\nAnnotation — bao gồm các track overlap"]
+            EXCL_ANN["exclusive_speaker_diarization\nAnnotation — 1 người nói / thời điểm"]
         end
 
-        SWEEP["_find_overlap_intervals()\nevent-sweep algorithm\ndepth ≥ 2 → overlap region"]
-        BUILD_SEGS["build SpeakerSegment list\nfrom exclusive annotation\n+ _segment_intersects_overlap()"]
-        RELABEL["_relabel_by_first_appearance()\nSPEAKER_00 = first to speak\nSPEAKER_01 = second, etc."]
+        SWEEP["_find_overlap_intervals()\nthuật toán event-sweep\ndepth ≥ 2 → vùng overlap"]
+        BUILD_SEGS["xây dựng danh sách SpeakerSegment\ntừ exclusive annotation\n+ _segment_intersects_overlap()"]
+        RELABEL["_relabel_by_first_appearance()\nSPEAKER_00 = người nói đầu tiên\nSPEAKER_01 = người thứ hai, v.v."]
         SEGMENTS[/"List[SpeakerSegment]\nspeaker_id, start_sec, end_sec, is_overlap"/]
     end
 
     subgraph ALIGN ["SECTION 4 — Alignment"]
-        ALIGN_FN["align_words_to_speakers()\nmax intersection-duration assignment\ngap fallback → inherit last speaker"]
-        MERGE["merge consecutive same-speaker words\n→ AlignedUtterance"]
+        ALIGN_FN["align_words_to_speakers()\ngán theo max intersection-duration\ngap fallback → kế thừa speaker trước"]
+        MERGE["gộp các từ liên tiếp cùng speaker\n→ AlignedUtterance"]
         UTTERANCES[/"List[AlignedUtterance]\nspeaker_id, start_sec, end_sec, text, is_overlap"/]
     end
 
-    subgraph OUTPUT ["SECTION 5 — Output"]
-        FORMAT["format_final_transcript()\n[MM:SS - MM:SS] SPEAKER_XX: text\n[OVERLAP] tag for overlap zones"]
-        SAVE["write to --output file\n(UTF-8)"]
+    subgraph OUTPUT ["SECTION 5 — Xuất kết quả"]
+        FORMAT["format_final_transcript()\n[MM:SS - MM:SS] SPEAKER_XX: text\nthêm tag [OVERLAP] cho vùng chen lấn"]
+        SAVE["ghi ra file --output\n(UTF-8)"]
         TRANSCRIPT([📄 Transcript])
     end
 
-    subgraph DEBUG ["Debug files  (--debug-dir)"]
-        D1["01_whisper_raw.txt\nper-word timestamps + confidence"]
-        D2["02_diarization_raw.txt\nper-speaker stats + segment list"]
+    subgraph DEBUG ["File debug  (--debug-dir)"]
+        D1["01_whisper_raw.txt\ntimestamp từng từ + confidence"]
+        D2["02_diarization_raw.txt\nthống kê theo speaker + danh sách segment"]
         D3["03_final_transcript.txt"]
-        D4["04_alignment_debug.txt\nside-by-side comparison table"]
+        D4["04_alignment_debug.txt\nbảng so sánh song song"]
     end
 
     INPUT --> CONVERT
@@ -105,8 +105,8 @@ flowchart TD
     CONVERT --> DENOISE
 
     LOAD_W --> DURATION_CHECK
-    DURATION_CHECK -- yes --> BATCHED
-    DURATION_CHECK -- no  --> STANDARD
+    DURATION_CHECK -- có --> BATCHED
+    DURATION_CHECK -- không --> STANDARD
     BATCHED  --> WORDS
     STANDARD --> WORDS
 
@@ -134,32 +134,32 @@ flowchart TD
 
 ---
 
-## Diagnose mode flowchart
+## Sơ đồ chế độ Diagnose
 
 ```mermaid
 flowchart LR
-    INPUT([Audio file])
+    INPUT([File audio])
     CONVERT["convert_audio_to_wav()"]
-    LOAD["load DiarizationPipeline"]
+    LOAD["tải DiarizationPipeline"]
 
     subgraph SWEEP_LOOP ["run_threshold_sweep()"]
         direction TB
-        THRESHOLDS["thresholds:\n0.55 → 0.90"]
+        THRESHOLDS["các threshold:\n0.55 → 0.90"]
         SET["_safe_set_pipeline_param\nclustering.threshold = t"]
         RUN["pipeline(wav_path)"]
-        COUNT["count unique speakers\ncount segments"]
-        PRINT["print row to table"]
+        COUNT["đếm số speaker\nđếm số segment"]
+        PRINT["in dòng ra bảng"]
         THRESHOLDS --> SET --> RUN --> COUNT --> PRINT --> THRESHOLDS
     end
 
-    TABLE([📊 Threshold × Speakers table])
+    TABLE([📊 Bảng Threshold × Số người nói])
 
     INPUT --> CONVERT --> LOAD --> SWEEP_LOOP --> TABLE
 ```
 
 ---
 
-## Data model relationships
+## Quan hệ giữa các data model
 
 ```mermaid
 classDiagram
@@ -185,55 +185,58 @@ classDiagram
         +bool is_overlap
     }
 
-    WordStamp      "N" --> "1" AlignedUtterance : merged by alignment
-    SpeakerSegment "1" --> "N" AlignedUtterance : tagged by speaker
+    WordStamp      "N" --> "1" AlignedUtterance : gộp bởi alignment
+    SpeakerSegment "1" --> "N" AlignedUtterance : gán nhãn speaker
 ```
 
 ---
 
-## Section responsibilities
+## Trách nhiệm từng section
 
-| Section | Functions | Responsibility |
+| Section | Hàm | Trách nhiệm |
 |---|---|---|
-| 1 — Audio | `convert_audio_to_wav` `probe_audio_duration` `denoise_wav` | Normalise input to WAV 16kHz mono; optional denoising for diarize path |
-| 2 — STT | `load_whisper_model` `transcribe` | Adaptive ASR (batched vs standard); returns `List[WordStamp]` |
-| 3 — Diarize | `diarize` + helpers | Load pyannote, detect overlaps via event-sweep, build + re-label segments |
-| 4 — Align | `align_words_to_speakers` | Assign each word to speaker by max temporal overlap; merge into utterances |
-| 5 — Format | `format_*` `save_alignment_debug` | Produce human-readable transcript and optional debug files |
-| 6 — Orchestrate | `run_pipeline` | Wire steps 1–5; manage temp directory; save outputs |
-| 7 — Diagnose | `run_threshold_sweep` | Fast threshold sweep without running Whisper |
-| 8 — CLI | `build_arg_parser` `main` | Parse arguments; dispatch to run_pipeline or run_threshold_sweep |
+| 1 — Audio | `convert_audio_to_wav` `probe_audio_duration` `denoise_wav` | Chuẩn hoá đầu vào thành WAV 16kHz mono; khử tiếng ồn tuỳ chọn cho nhánh diarize |
+| 2 — STT | `load_whisper_model` `transcribe` | ASR thích ứng (batched vs standard); trả về `List[WordStamp]` |
+| 3 — Diarize | `diarize` + các hàm hỗ trợ | Tải pyannote, phát hiện overlap bằng event-sweep, xây dựng và đặt lại nhãn segment |
+| 4 — Align | `align_words_to_speakers` | Gán từng từ vào speaker theo max temporal overlap; gộp thành utterance |
+| 5 — Format | `format_*` `save_alignment_debug` | Tạo transcript dạng người đọc được và các file debug tuỳ chọn |
+| 6 — Điều phối | `run_pipeline` | Kết nối các bước 1–5; quản lý thư mục tạm; lưu kết quả |
+| 7 — Diagnose | `run_threshold_sweep` | Quét threshold nhanh, không chạy Whisper |
+| 8 — CLI | `build_arg_parser` `main` | Phân tích tham số; điều hướng sang `run_pipeline` hoặc `run_threshold_sweep` |
 
 ---
 
-## Key design decisions
+## Các quyết định thiết kế quan trọng
 
-### Adaptive inference (Section 2)
-Audio longer than 30 minutes uses `BatchedInferencePipeline` for throughput.
-Shorter audio uses `WhisperModel.transcribe` directly for lower latency.
-VAD must be set explicitly (`vad_filter=True`) in the non-batched path.
+### Inference thích ứng theo độ dài (Section 2)
 
-### Split-input denoising (Section 1 + 6)
-When `--denoise` is enabled, only the diarization pass receives the denoised
-audio. Whisper always receives the original WAV because spectral gating can
-distort phonemes (especially Japanese short vowels and geminate consonants),
-which would increase word error rate.
+Audio dài hơn 30 phút sử dụng `BatchedInferencePipeline` để tăng throughput.
+Audio ngắn hơn dùng trực tiếp `WhisperModel.transcribe` để giảm latency.
+Ở nhánh non-batched, VAD phải được bật tường minh (`vad_filter=True`) vì nó không tự động bật như ở nhánh batched.
 
-### Overlap detection via event-sweep (Section 3)
-Rather than comparing timestamps between two annotations directly (fragile due
-to floating-point differences), the pipeline builds an event list of
-segment-open (+1) and segment-close (-1) events from `speaker_diarization`,
-then sweeps through time. Any interval where depth ≥ 2 is an overlap region.
-`exclusive_speaker_diarization` segments are then tagged via interval intersection.
+### Khử tiếng ồn tách biệt cho từng nhánh (Section 1 + 6)
 
-### Chronological speaker re-labeling (Section 3)
-pyannote assigns speaker IDs from internal clustering order, not appearance order.
-After sorting segments by `start_sec`, the pipeline walks the list once and
-assigns `SPEAKER_00` to the first new speaker encountered, `SPEAKER_01` to the
-second, and so on. This makes transcripts easier to read.
+Khi bật `--denoise`, chỉ nhánh diarization nhận file WAV đã khử nhiễu.
+Whisper luôn nhận WAV gốc vì spectral gating có thể làm biến dạng âm vị —
+đặc biệt là các nguyên âm ngắn và phụ âm geminata trong tiếng Nhật —
+dẫn đến tăng word error rate.
 
-### Word assignment by max overlap (Section 4)
-Each `WordStamp` is assigned to the `SpeakerSegment` whose time interval
-overlaps it the most. This is more robust than simple containment checks,
-especially at segment boundaries where a word's timestamp may straddle
-two adjacent segments.
+### Phát hiện overlap bằng event-sweep (Section 3)
+
+Thay vì so sánh trực tiếp timestamp giữa hai annotation (dễ sai do sai số dấu phẩy động),
+pipeline xây dựng danh sách sự kiện mở (+1) và đóng (-1) của từng segment từ `speaker_diarization`,
+rồi quét theo thời gian. Bất kỳ khoảng nào có depth ≥ 2 là vùng overlap.
+Các segment trong `exclusive_speaker_diarization` sau đó được đánh dấu qua phép kiểm tra giao khoảng thời gian.
+
+### Đặt lại nhãn speaker theo thứ tự xuất hiện (Section 3)
+
+pyannote gán speaker ID theo thứ tự clustering nội bộ, không theo thứ tự xuất hiện trong audio.
+Sau khi sắp xếp các segment theo `start_sec`, pipeline duyệt danh sách một lần
+và gán `SPEAKER_00` cho speaker mới đầu tiên gặp được, `SPEAKER_01` cho speaker thứ hai, v.v.
+Cách này giúp transcript dễ đọc hơn vì số thứ tự khớp với thứ tự lên tiếng thực tế.
+
+### Gán từ theo max overlap (Section 4)
+
+Mỗi `WordStamp` được gán cho `SpeakerSegment` có khoảng thời gian giao nhau nhiều nhất với từ đó.
+Cách này bền vững hơn kiểm tra containment đơn thuần, đặc biệt ở ranh giới segment
+nơi timestamp của một từ có thể nằm vắt ngang giữa hai segment liền kề.
