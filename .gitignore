@@ -1,4 +1,5 @@
 .env
 audios/
-outputs/
 .venv
+__pycache__/
+debug_output/

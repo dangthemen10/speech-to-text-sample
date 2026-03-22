@@ -1,76 +1,57 @@
 """
-=============================================================================
-  Speech-to-Text + Speaker Diarization Demo (Japanese-optimized)
-  Stack : faster-whisper (large-v3) + pyannote/speaker-diarization-community-1
-  Author: AI Engineer Demo
-  Python: 3.9+
-=============================================================================
+Speech-to-Text + Speaker Diarization — Japanese-optimized pipeline
+===================================================================
+Stack  : faster-whisper (large-v3)  +  pyannote/speaker-diarization-community-1
+Python : 3.9+
 
-SETUP CHECKLIST (đọc trước khi chạy)
---------------------------------------
-1. Cài ffmpeg ở cấp hệ điều hành:
-     Ubuntu/Debian : sudo apt install ffmpeg
-     macOS (brew)  : brew install ffmpeg
-     Windows       : https://ffmpeg.org/download.html  (thêm vào PATH)
-
-2. Tạo Hugging Face Access Token:
-     → https://hf.co/settings/tokens
-     Chọn loại "Read", đặt tên, rồi copy token.
-
-3. Chấp nhận điều khoản sử dụng model diarization:
-     → https://huggingface.co/pyannote/speaker-diarization-community-1
-     Nhấn "Agree and access repository" trên trang model.
-     (Nếu bỏ qua bước này, pipeline sẽ báo lỗi 403.)
-
-4. Đặt token vào biến môi trường (khuyến nghị – không hard-code):
-     export HF_TOKEN="hf_xxxxxxxxxxxxxxxxxxxx"
-   Hoặc truyền trực tiếp qua tham số CLI: --hf-token hf_xxx...
-
-5. Cài dependencies:
-     pip install -r requirements.txt
-=============================================================================
+BEFORE RUNNING — see README.md for full setup instructions.
 """
 
 import os
 import sys
-import subprocess
-import argparse
 import logging
+import argparse
 import tempfile
+import subprocess
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-# ── Tắt telemetry của pyannote.audio TRƯỚC KHI import bất kỳ thứ gì ──────────
-os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
-# Tắt thêm analytics của Lightning / PyTorch Lightning nếu có
+# ---------------------------------------------------------------------------
+# Disable pyannote / Lightning telemetry BEFORE any third-party imports
+# ---------------------------------------------------------------------------
+os.environ["PYANNOTE_METRICS_ENABLED"]    = "false"
 os.environ["LIGHTNING_DISABLE_ANALYTICS"] = "1"
-os.environ["PL_DISABLE_TELEMETRY"] = "1"
+os.environ["PL_DISABLE_TELEMETRY"]        = "1"
 
-# ── Third-party imports (lazy để bắt ImportError rõ ràng) ────────────────────
+# ---------------------------------------------------------------------------
+# Third-party imports — fail fast with actionable messages
+# ---------------------------------------------------------------------------
 try:
     from faster_whisper import WhisperModel, BatchedInferencePipeline
 except ImportError:
-    sys.exit("❌  faster-whisper chưa được cài.  Chạy: pip install faster-whisper")
+    sys.exit("❌  faster-whisper not installed.  Run: pip install faster-whisper")
 
 try:
-    from pyannote.audio import Pipeline as PyannotePipeline
+    from pyannote.audio import Pipeline as DiarizationPipeline
 except ImportError:
-    sys.exit("❌  pyannote.audio chưa được cài.  Chạy: pip install pyannote.audio")
+    sys.exit("❌  pyannote.audio not installed.  Run: pip install pyannote.audio>=4.0.1")
 
 try:
     import torch
 except ImportError:
-    sys.exit("❌  torch chưa được cài.  Chạy: pip install torch")
+    sys.exit("❌  torch not installed.  Run: pip install torch>=2.8.0")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-LONG_AUDIO_THRESHOLD_SECONDS = 30 * 60   # 30 phút
-WHISPER_MODEL_SIZE            = "large-v3"
-DIARIZATION_MODEL_ID          = "pyannote/speaker-diarization-community-1"
-TARGET_SAMPLE_RATE            = 16_000
-TARGET_CHANNELS               = 1
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
+
+WHISPER_MODEL_SIZE                  = "large-v3"
+DIARIZATION_MODEL_ID                = "pyannote/speaker-diarization-community-1"
+AUDIO_SAMPLE_RATE                   = 16_000   # Hz — required by both models
+AUDIO_CHANNELS                      = 1        # mono
+BATCHED_PIPELINE_THRESHOLD_MINUTES  = 30       # use BatchedInferencePipeline above this
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,110 +61,63 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data structures
-# ─────────────────────────────────────────────────────────────────────────────
-@dataclass
-class WordToken:
-    """Một từ đơn với thông tin thời gian từ faster-whisper."""
-    word:        str
-    start:       float
-    end:         float
-    probability: float = 1.0
-
+# ===========================================================================
+# DATA MODELS
+# ===========================================================================
 
 @dataclass
-class DiarizationSegment:
-    """Một khoảng thời gian được gán cho một người nói cụ thể."""
-    speaker: str
-    start:   float
-    end:     float
-    is_overlap: bool = False   # True nếu đây là vùng overlapped speech
+class WordStamp:
+    """A single word with millisecond-precise timestamps from Whisper."""
+    text:        str
+    start_sec:   float
+    end_sec:     float
+    confidence:  float = 1.0
 
 
 @dataclass
-class AlignedSegment:
-    """Kết quả sau khi gán từng từ vào người nói."""
-    speaker:  str
-    start:    float
-    end:      float
-    text:     str
-    is_overlap: bool = False
+class SpeakerSegment:
+    """A time interval attributed to one speaker by pyannote."""
+    speaker_id:  str
+    start_sec:   float
+    end_sec:     float
+    is_overlap:  bool = False   # True when multiple speakers talked simultaneously
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Audio utilities
-# ─────────────────────────────────────────────────────────────────────────────
-def convert_to_wav(input_path: str, output_path: str) -> None:
-    """Dùng ffmpeg chuyển bất kỳ file audio → WAV 16 kHz mono PCM-16."""
+@dataclass
+class AlignedUtterance:
+    """Final output unit: speaker + text + timestamps, produced after alignment."""
+    speaker_id:  str
+    start_sec:   float
+    end_sec:     float
+    text:        str
+    is_overlap:  bool = False
+
+
+# ===========================================================================
+# SECTION 1 — AUDIO UTILITIES
+# ===========================================================================
+
+def convert_audio_to_wav(src_path: str, dst_path: str) -> None:
+    """
+    Convert any ffmpeg-supported audio/video file to WAV 16 kHz mono PCM-16.
+    Both Whisper and pyannote require this exact format.
+    """
     cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-ar", str(TARGET_SAMPLE_RATE),
-        "-ac", str(TARGET_CHANNELS),
+        "ffmpeg", "-y", "-i", src_path,
+        "-ar", str(AUDIO_SAMPLE_RATE),
+        "-ac", str(AUDIO_CHANNELS),
         "-sample_fmt", "s16",
-        output_path,
+        dst_path,
     ]
-    log.info("🔄  Đang chuyển đổi audio → WAV 16 kHz mono …")
+    log.info("🔄  Converting audio → WAV 16 kHz mono …")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg thất bại:\n{result.stderr}"
-        )
-    log.info("✅  Chuyển đổi xong: %s", output_path)
+        raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
+    log.info("✅  Converted: %s", dst_path)
 
 
-def denoise_wav(input_wav: str, output_wav: str, strength: float = 0.85) -> None:
-    """
-    Khử tiếng ồn nền bằng noisereduce (spectral gating).
-
-    Đặc biệt hữu ích khi:
-      - Audio ghi ở văn phòng / quán cà phê (tiếng ồn stationary)
-      - Giọng 2 người gần nhau → embedding bị nhiễu → diarization nhầm speaker
-      - File ngắn < 5 phút → ít data để pipeline tự phân biệt
-
-    Cơ chế: ước tính noise profile từ toàn bộ signal (stationary noise),
-    sau đó dùng spectral gating để lọc các tần số dưới ngưỡng noise.
-
-    strength: 0.0 = không lọc, 1.0 = lọc mạnh nhất
-              0.75–0.85 là sweet spot cho audio hội thoại văn phòng
-              Quá cao (>0.95) có thể làm mất âm vị → Whisper WER tăng
-
-    Requires: pip install noisereduce soundfile
-    """
-    try:
-        import noisereduce as nr
-        import soundfile as sf
-    except ImportError:
-        log.warning(
-            "⚠️  noisereduce chưa được cài → bỏ qua bước denoising.\n"
-            "   Để bật: pip install noisereduce soundfile"
-        )
-        # Copy file gốc sang output mà không làm gì
-        import shutil
-        shutil.copy2(input_wav, output_wav)
-        return
-
-    log.info("🔇  Đang khử tiếng ồn (strength=%.2f) …", strength)
-    data, sr = sf.read(input_wav, dtype="float32")
-
-    # noisereduce ước tính noise từ toàn bộ clip (stationary mode)
-    # prop_decrease = strength: tỉ lệ giảm noise (0→1)
-    reduced = nr.reduce_noise(
-        y             = data,
-        sr            = sr,
-        stationary    = True,
-        prop_decrease = strength,
-        n_fft         = 1024,
-        hop_length    = 256,
-    )
-
-    sf.write(output_wav, reduced, sr, subtype="PCM_16")
-    log.info("✅  Denoising xong: %s", output_wav)
-
-
-def get_audio_duration_seconds(wav_path: str) -> float:
-    """Lấy độ dài (giây) của file WAV bằng ffprobe."""
+def probe_audio_duration(wav_path: str) -> float:
+    """Return duration in seconds using ffprobe (no extra library needed)."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -192,954 +126,872 @@ def get_audio_duration_seconds(wav_path: str) -> float:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"ffprobe thất bại:\n{result.stderr}")
+        raise RuntimeError(f"ffprobe failed:\n{result.stderr}")
     return float(result.stdout.strip())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Whisper transcription (Adaptive Inference)
-# ─────────────────────────────────────────────────────────────────────────────
-def build_whisper_model(device: str, compute_type: str) -> WhisperModel:
-    """Khởi tạo WhisperModel large-v3."""
-    log.info(
-        "🧠  Đang tải Whisper %s (device=%s, compute=%s) …",
-        WHISPER_MODEL_SIZE, device, compute_type,
+def denoise_wav(src_path: str, dst_path: str, strength: float = 0.85) -> None:
+    """
+    Apply spectral-gating noise reduction via noisereduce.
+
+    Recommended when:
+      - Background noise is stationary (office fan, AC, café ambience)
+      - Two speakers have similar voice profiles — diarization confuses them
+      - Audio is short (< 5 min) and noise corrupts speaker embeddings
+
+    strength: 0.0 = no reduction  |  1.0 = maximum  |  sweet spot = 0.75–0.85
+    Values above 0.95 may distort phonemes and hurt Whisper accuracy.
+
+    NOTE: Only used for the diarization pass. Whisper always receives the
+    original WAV to preserve ASR quality.
+
+    Requires: pip install noisereduce soundfile
+    """
+    try:
+        import noisereduce as nr
+        import soundfile as sf
+    except ImportError:
+        log.warning("⚠️  noisereduce not installed — skipping denoising. "
+                    "Run: pip install noisereduce soundfile")
+        import shutil
+        shutil.copy2(src_path, dst_path)
+        return
+
+    log.info("🔇  Denoising (strength=%.2f) …", strength)
+    audio_data, sample_rate = sf.read(src_path, dtype="float32")
+    denoised = nr.reduce_noise(
+        y=audio_data, sr=sample_rate,
+        stationary=True,
+        prop_decrease=strength,
+        n_fft=1024,
+        hop_length=256,
     )
-    model = WhisperModel(
-        WHISPER_MODEL_SIZE,
-        device=device,
-        compute_type=compute_type,
-    )
-    log.info("✅  Whisper model đã sẵn sàng.")
+    sf.write(dst_path, denoised, sample_rate, subtype="PCM_16")
+    log.info("✅  Denoised: %s", dst_path)
+
+
+# ===========================================================================
+# SECTION 2 — SPEECH-TO-TEXT  (faster-whisper, adaptive inference)
+# ===========================================================================
+
+def load_whisper_model(device: str, compute_type: str) -> WhisperModel:
+    """
+    Load Whisper large-v3.
+    compute_type = float16 on GPU for speed, int8 on CPU to save RAM.
+    """
+    log.info("🧠  Loading Whisper %s (device=%s, compute=%s) …",
+             WHISPER_MODEL_SIZE, device, compute_type)
+    model = WhisperModel(WHISPER_MODEL_SIZE, device=device, compute_type=compute_type)
+    log.info("✅  Whisper ready.")
     return model
 
 
-def transcribe_audio(
-    wav_path: str,
-    model: WhisperModel,
-    duration_seconds: float,
-    language: str = "ja",
+def transcribe(
+    wav_path:       str,
+    model:          WhisperModel,
+    duration_sec:   float,
+    language:       str = "ja",
     initial_prompt: Optional[str] = None,
-) -> List[WordToken]:
+) -> List[WordStamp]:
     """
-    Nhận dạng giọng nói và trả về danh sách WordToken (word-level timestamps).
+    Run ASR and return per-word timestamps.
 
-    Adaptive Inference:
-      - duration > 30 phút  → BatchedInferencePipeline  (throughput cao hơn)
-      - duration ≤ 30 phút  → WhisperModel.transcribe   (latency thấp hơn)
+    Adaptive inference:
+      > 30 min  → BatchedInferencePipeline  (higher throughput, VAD on by default)
+      ≤ 30 min  → WhisperModel.transcribe   (lower latency, VAD set explicitly)
 
-    Tham số initial_prompt giúp mồi mô hình nhận diện đúng danh từ riêng /
-    từ vựng chuyên ngành tiếng Nhật.
-    Ví dụ:
-        initial_prompt = "トヨタ自動車、本田技研工業、ソフトバンクグループ"
+    initial_prompt:
+      Seed Whisper with domain vocabulary or proper nouns to improve accuracy.
+      Example: "トヨタ自動車、ソフトバンクグループ、田中部長"
     """
-    common_kwargs = dict(
+    shared_params = dict(
         language=language,
-        word_timestamps=True,       # ← bắt buộc để lấy word-level timestamps
+        word_timestamps=True,           # required for word-level alignment
         initial_prompt=initial_prompt,
         beam_size=5,
         best_of=5,
-        temperature=0.0,            # greedy, ổn định hơn cho tác vụ business
+        temperature=0.0,                # greedy decoding — stable for business use
         condition_on_previous_text=True,
     )
 
-    if duration_seconds > LONG_AUDIO_THRESHOLD_SECONDS:
-        log.info(
-            "⏱  Độ dài %.1f phút > 30 phút → dùng BatchedInferencePipeline.",
-            duration_seconds / 60,
-        )
-        pipeline = BatchedInferencePipeline(model=model)
-        # VAD được bật mặc định trong BatchedInferencePipeline
-        segments_iter, info = pipeline.transcribe(
-            wav_path,
-            batch_size=16,
-            **common_kwargs,
-        )
+    duration_min = duration_sec / 60
+    if duration_sec > BATCHED_PIPELINE_THRESHOLD_MINUTES * 60:
+        log.info("⏱  %.1f min > %d min threshold → BatchedInferencePipeline",
+                 duration_min, BATCHED_PIPELINE_THRESHOLD_MINUTES)
+        batched = BatchedInferencePipeline(model=model)
+        segments_iter, info = batched.transcribe(wav_path, batch_size=16, **shared_params)
     else:
-        log.info(
-            "⏱  Độ dài %.1f phút ≤ 30 phút → dùng WhisperModel.transcribe.",
-            duration_seconds / 60,
-        )
+        log.info("⏱  %.1f min ≤ %d min threshold → WhisperModel.transcribe",
+                 duration_min, BATCHED_PIPELINE_THRESHOLD_MINUTES)
         segments_iter, info = model.transcribe(
             wav_path,
-            vad_filter=True,            # ← phải truyền thủ công ở đây
-            vad_parameters=dict(
-                min_silence_duration_ms=500,
-                speech_pad_ms=400,
-            ),
-            **common_kwargs,
+            vad_filter=True,    # must be set manually in non-batched path
+            vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=400),
+            **shared_params,
         )
 
-    log.info(
-        "🌐  Ngôn ngữ phát hiện: %s (xác suất %.2f)",
-        info.language, info.language_probability,
-    )
+    log.info("🌐  Detected language: %s (confidence=%.2f)",
+             info.language, info.language_probability)
 
-    words: List[WordToken] = []
-    for seg in segments_iter:
-        if seg.words is None:
+    words: List[WordStamp] = []
+    for segment in segments_iter:
+        if segment.words is None:
             continue
-        for w in seg.words:
-            words.append(WordToken(
-                word=w.word,
-                start=w.start,
-                end=w.end,
-                probability=w.probability,
+        for w in segment.words:
+            words.append(WordStamp(
+                text=w.word,
+                start_sec=w.start,
+                end_sec=w.end,
+                confidence=w.probability,
             ))
 
-    log.info("✅  Transcription xong: %d từ.", len(words))
+    log.info("✅  Transcription done: %d words.", len(words))
     return words
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Speaker Diarization
-# ─────────────────────────────────────────────────────────────────────────────
-def run_diarization(
-    wav_path: str,
-    hf_token: str,
-    num_speakers: Optional[int] = None,
-    min_speakers: Optional[int] = None,
-    max_speakers: Optional[int] = None,
-    clustering_threshold:   Optional[float] = None,
-    segmentation_threshold: Optional[float] = None,
-) -> List[DiarizationSegment]:
+# ===========================================================================
+# SECTION 3 — SPEAKER DIARIZATION  (pyannote community-1)
+# ===========================================================================
+
+def _iter_annotation(annotation):
     """
-    Chạy pyannote/speaker-diarization-community-1 và trả về
-    List[DiarizationSegment] đã đánh dấu is_overlap.
-
-    ── Cấu trúc DiarizeOutput của community-1 ──────────────────────────────
-    Pipeline trả về dataclass DiarizeOutput với 3 fields:
-
-      .exclusive_speaker_diarization  →  pyannote Annotation
-          Kết quả diarization "sạch": mỗi thời điểm chỉ có DUY NHẤT 1 speaker.
-          Đây là output chính để dùng cho alignment với Whisper transcript.
-          Speaker change detection đã được tích hợp tự động bên trong pipeline.
-
-      .speaker_diarization            →  pyannote Annotation
-          Kết quả đầy đủ CÓ overlap: các vùng nhiều người nói cùng lúc
-          được biểu diễn bằng NHIỀU TRACK song song (track A + track B
-          cùng tồn tại trong khoảng [t1, t2]).
-          Overlapped speech detection đã được tích hợp tự động.
-
-      .speaker_embeddings             →  numpy array
-          Vector embedding của từng speaker (không dùng trong pipeline này).
-
-    ── Chiến lược implementation đúng ──────────────────────────────────────
-    1. Parse TOÀN BỘ tracks từ .speaker_diarization → danh sách thô
-    2. Xây dựng "overlap timeline" bằng interval sweep:
-       - Với mỗi điểm thời gian, đếm số tracks đang active
-       - Nếu > 1 track active → đó là vùng overlapped speech
-    3. Với mỗi segment trong .exclusive_speaker_diarization,
-       kiểm tra xem nó có giao với vùng overlap không → set is_overlap
-    4. Trả về List[DiarizationSegment] từ exclusive (để alignment ổn định)
-       kèm is_overlap flag chính xác.
-
-    ── Tại sao KHÔNG dùng key-matching float ───────────────────────────────
-    .speaker_diarization và .exclusive_speaker_diarization được tính toán
-    độc lập, timestamps của chúng KHÔNG khớp chính xác nhau dù round().
-    Phải dùng interval intersection thay vì key lookup.
-
-    ── HF Token ────────────────────────────────────────────────────────────
-    pyannote.audio >= 3.x dùng tham số `token` (không phải use_auth_token).
-    Token cần có quyền Read và user phải accept điều khoản tại:
-    https://huggingface.co/pyannote/speaker-diarization-community-1
+    Yield (Segment, speaker_label) from a pyannote Annotation.
+    Handles both pyannote 3.x (3-tuple) and 4.x (2-tuple) iteration APIs.
     """
-    log.info("🎙  Đang tải diarization pipeline: %s …", DIARIZATION_MODEL_ID)
-    pipe = PyannotePipeline.from_pretrained(
-        DIARIZATION_MODEL_ID,
-        token=hf_token,
-    )
+    try:
+        for item in annotation.itertracks(yield_label=True):
+            # pyannote 3.x returns (Segment, track_id, label)
+            # pyannote 4.x returns (Segment, label)
+            turn, speaker = (item[0], item[2]) if len(item) == 3 else item
+            yield turn, speaker
+    except Exception:
+        for turn, speaker in annotation:   # 4.x direct iteration fallback
+            yield turn, speaker
 
-    device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pipe = pipe.to(device_obj)
 
-    # ── Apply threshold overrides nếu có (sau khi pipe đã được instantiate) ─
-    _apply_pipeline_overrides(pipe, clustering_threshold, segmentation_threshold)
+def _find_overlap_intervals(full_annotation) -> List[Tuple[float, float]]:
+    """
+    Return time intervals where 2+ speakers spoke simultaneously.
 
-    log.info("🎙  Diarization đang chạy trên %s …", device_obj)
-
-    diarize_kwargs: dict = {}
-    if num_speakers is not None:
-        diarize_kwargs["num_speakers"] = num_speakers
-    else:
-        if min_speakers is not None:
-            diarize_kwargs["min_speakers"] = min_speakers
-        if max_speakers is not None:
-            diarize_kwargs["max_speakers"] = max_speakers
-
-    output = pipe(wav_path, **diarize_kwargs)
-    # output là DiarizeOutput dataclass
-    # output.exclusive_speaker_diarization → Annotation (1 speaker/thời điểm)
-    # output.speaker_diarization           → Annotation (có overlap tracks)
-
-    # ── Helper: iterate Annotation tương thích pyannote 3.x và 4.x ──────────
-    # pyannote 3.x: itertracks(yield_label=True) → (Segment, track_id, label)
-    # pyannote 4.x: for turn, speaker in annotation → (Segment, label)  [official example]
-    #               itertracks vẫn còn nhưng signature có thể thay đổi
-    def _iter_annotation(annotation):
-        """Yield (turn, speaker) từ pyannote Annotation, tương thích 3.x và 4.x."""
-        try:
-            # Thử 3-tuple trước (pyannote 3.x standard)
-            for item in annotation.itertracks(yield_label=True):
-                if len(item) == 3:
-                    turn, _track, speaker = item
-                else:
-                    turn, speaker = item
-                yield turn, speaker
-        except Exception:
-            # Fallback: iterate trực tiếp theo official 4.x example
-            for turn, speaker in annotation:
-                yield turn, speaker
-
-    # ── Bước 1: Xây dựng overlap timeline bằng interval sweep ───────────────
+    Uses an event-sweep algorithm:
+      - Each segment contributes a +1 (open) and -1 (close) event.
+      - Whenever active depth >= 2, we are in an overlap region.
+    """
     events: List[Tuple[float, int]] = []
-    for turn, _ in _iter_annotation(output.speaker_diarization):
+    for turn, _ in _iter_annotation(full_annotation):
         events.append((turn.start, +1))
         events.append((turn.end,   -1))
 
-    # Sort: cùng timestamp thì event mở (+1) đến trước event đóng (-1)
-    events.sort(key=lambda e: (e[0], -e[1]))
+    events.sort(key=lambda e: (e[0], -e[1]))  # ties: open before close
 
-    # Quét để tìm các khoảng thời gian có depth >= 2 (overlap)
     overlap_intervals: List[Tuple[float, float]] = []
-    depth      = 0
+    active_depth = 0
     overlap_start: Optional[float] = None
 
-    for t, delta in events:
-        if depth >= 2 and overlap_start is not None:
-            if t > overlap_start:
-                overlap_intervals.append((overlap_start, t))
-        depth += delta
-        if depth >= 2:
-            overlap_start = t
-        else:
-            overlap_start = None
+    for timestamp, delta in events:
+        if active_depth >= 2 and overlap_start is not None and timestamp > overlap_start:
+            overlap_intervals.append((overlap_start, timestamp))
+        active_depth += delta
+        overlap_start = timestamp if active_depth >= 2 else None
 
-    log.info("📊  Overlap intervals phát hiện: %d vùng", len(overlap_intervals))
+    return overlap_intervals
 
-    # ── Bước 2: Helper kiểm tra segment có giao với overlap interval không ──
-    def _is_in_overlap(seg_start: float, seg_end: float) -> bool:
-        for ov_start, ov_end in overlap_intervals:
-            if ov_start < seg_end and ov_end > seg_start:
-                return True
-        return False
 
-    # ── Bước 3: Build DiarizationSegment từ exclusive annotation ────────────
-    segments: List[DiarizationSegment] = []
-
-    for turn, speaker in _iter_annotation(output.exclusive_speaker_diarization):
-        segments.append(DiarizationSegment(
-            speaker    = speaker,
-            start      = turn.start,
-            end        = turn.end,
-            is_overlap = _is_in_overlap(turn.start, turn.end),
-        ))
-
-    segments.sort(key=lambda s: s.start)
-
-    # ── Re-label speaker theo thứ tự xuất hiện trong timeline ───────────────
-    # Pyannote gán label (SPEAKER_00, SPEAKER_01...) theo clustering index,
-    # không theo thứ tự thời gian → đôi khi SPEAKER_00 xuất hiện sau SPEAKER_01.
-    # Re-map lại để SPEAKER_00 = người nói đầu tiên, SPEAKER_01 = người thứ hai...
-    label_map: dict = {}
-    for seg in segments:
-        if seg.speaker not in label_map:
-            idx = len(label_map)
-            label_map[seg.speaker] = f"SPEAKER_{idx:02d}"
-
-    if label_map:
-        original_labels = sorted(label_map.keys())
-        new_labels      = [label_map[k] for k in original_labels]
-        if original_labels != new_labels:
-            log.info("🔀  Re-label speakers theo thứ tự xuất hiện:")
-            for orig, new in label_map.items():
-                if orig != new:
-                    log.info("     %s → %s", orig, new)
-            for seg in segments:
-                seg.speaker = label_map[seg.speaker]
-
-    overlap_count   = sum(1 for s in segments if s.is_overlap)
-    unique_speakers = {s.speaker for s in segments}
-
-    log.info(
-        "✅  Diarization xong: %d segments | %d người nói | %d segments có overlap",
-        len(segments), len(unique_speakers), overlap_count,
+def _segment_intersects_overlap(
+    seg_start: float,
+    seg_end:   float,
+    overlap_intervals: List[Tuple[float, float]],
+) -> bool:
+    """Return True if [seg_start, seg_end] overlaps any overlap interval."""
+    return any(
+        ov_start < seg_end and ov_end > seg_start
+        for ov_start, ov_end in overlap_intervals
     )
-    log.info("👥  Speakers (theo thứ tự xuất hiện): %s", sorted(unique_speakers))
+
+
+def _relabel_by_first_appearance(segments: List[SpeakerSegment]) -> None:
+    """
+    Reassign speaker IDs so SPEAKER_00 = first to speak, SPEAKER_01 = second, etc.
+
+    pyannote assigns IDs from internal clustering order, which does NOT
+    guarantee chronological order. This function fixes that discrepancy.
+    Mutates segments in-place.
+    """
+    id_map: dict = {}
+    for seg in segments:
+        if seg.speaker_id not in id_map:
+            id_map[seg.speaker_id] = f"SPEAKER_{len(id_map):02d}"
+
+    if any(orig != new for orig, new in id_map.items()):
+        log.info("🔀  Re-labeling speakers by first appearance:")
+        for orig, new in id_map.items():
+            if orig != new:
+                log.info("     %s → %s", orig, new)
+        for seg in segments:
+            seg.speaker_id = id_map[seg.speaker_id]
+
+
+def _apply_hyperparameter_overrides(
+    pipeline,
+    clustering_threshold:   Optional[float],
+    segmentation_threshold: Optional[float],
+) -> None:
+    """
+    Override pyannote pipeline hyperparameters post-load.
+
+    clustering_threshold:
+      Higher (0.80+) → fewer speakers, fixes over-segmentation
+      Lower  (0.55–) → more speakers, fixes under-segmentation
+
+    segmentation_threshold:
+      Lower (0.60–0.75) → catches more short speech bursts
+
+    Tries two paths: pipeline.instantiate() then direct attribute set.
+    Warns if neither works (API varies across pyannote versions).
+    """
+    try:
+        current = pipeline.parameters(instantiated=True)
+        flat    = _flatten_dict(current)
+        log.info("📐  Pipeline params: %s", ", ".join(f"{k}={v}" for k, v in flat.items()))
+    except Exception:
+        pass
+
+    for param_path, value in [
+        (["clustering",   "threshold"], clustering_threshold),
+        (["segmentation", "threshold"], segmentation_threshold),
+    ]:
+        if value is None:
+            continue
+        _safe_set_pipeline_param(pipeline, param_path, value)
+        log.info("🔧  %s → %.3f", ".".join(param_path), value)
+
+
+def _flatten_dict(d: dict, prefix: str = "") -> dict:
+    """Flatten nested dict: {a: {b: v}} → {'a.b': v}."""
+    out = {}
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else k
+        out.update(_flatten_dict(v, key) if isinstance(v, dict) else {key: v})
+    return out
+
+
+def _safe_set_pipeline_param(pipeline, path: List[str], value: float) -> None:
+    """
+    Set a nested pipeline parameter via two strategies:
+      1. pipeline.instantiate() (preferred, pyannote official API)
+      2. Direct attribute traversal (fallback)
+    """
+    try:
+        params = pipeline.parameters(instantiated=True)
+        section, key = path[0], path[1]
+        if section in params and key in params[section]:
+            params[section][key] = value
+            pipeline.instantiate(params)
+            return
+    except Exception:
+        pass
+
+    try:
+        obj = pipeline
+        for attr in path[:-1]:
+            obj = getattr(obj, attr)
+        setattr(obj, path[-1], value)
+    except Exception:
+        log.warning("⚠️  Could not set %s — may differ across pyannote versions.",
+                    ".".join(path))
+
+
+def diarize(
+    wav_path:               str,
+    hf_token:               str,
+    num_speakers:           Optional[int]   = None,
+    min_speakers:           Optional[int]   = None,
+    max_speakers:           Optional[int]   = None,
+    clustering_threshold:   Optional[float] = None,
+    segmentation_threshold: Optional[float] = None,
+) -> List[SpeakerSegment]:
+    """
+    Run pyannote/speaker-diarization-community-1 and return speaker segments.
+
+    community-1 DiarizeOutput fields:
+      .speaker_diarization           — full annotation incl. simultaneous tracks
+      .exclusive_speaker_diarization — 1 speaker per moment (used for alignment)
+      .speaker_embeddings            — per-speaker embedding vectors
+
+    Pipeline steps:
+      1. Detect overlap regions from .speaker_diarization via event-sweep
+      2. Build SpeakerSegment list from .exclusive_speaker_diarization
+      3. Tag segments that intersect detected overlap regions
+      4. Re-label speaker IDs in chronological order of first appearance
+
+    HF token: must have "read" scope and the model's terms must be accepted at
+      https://huggingface.co/pyannote/speaker-diarization-community-1
+    """
+    log.info("🎙  Loading diarization pipeline: %s …", DIARIZATION_MODEL_ID)
+    pipeline = DiarizationPipeline.from_pretrained(DIARIZATION_MODEL_ID, token=hf_token)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipeline = pipeline.to(device)
+    log.info("🎙  Running diarization on %s …", device)
+
+    _apply_hyperparameter_overrides(pipeline, clustering_threshold, segmentation_threshold)
+
+    run_kwargs: dict = {}
+    if num_speakers is not None:
+        run_kwargs["num_speakers"] = num_speakers
+    else:
+        if min_speakers is not None:
+            run_kwargs["min_speakers"] = min_speakers
+        if max_speakers is not None:
+            run_kwargs["max_speakers"] = max_speakers
+
+    output = pipeline(wav_path, **run_kwargs)
+
+    # Step 1: find overlap regions
+    overlap_intervals = _find_overlap_intervals(output.speaker_diarization)
+    log.info("📊  Overlap intervals detected: %d", len(overlap_intervals))
+
+    # Steps 2–3: build segment list from exclusive annotation
+    segments: List[SpeakerSegment] = [
+        SpeakerSegment(
+            speaker_id=speaker,
+            start_sec=turn.start,
+            end_sec=turn.end,
+            is_overlap=_segment_intersects_overlap(turn.start, turn.end, overlap_intervals),
+        )
+        for turn, speaker in _iter_annotation(output.exclusive_speaker_diarization)
+    ]
+    segments.sort(key=lambda s: s.start_sec)
+
+    # Step 4: re-label chronologically
+    _relabel_by_first_appearance(segments)
+
+    unique_speakers = sorted({s.speaker_id for s in segments})
+    overlap_count   = sum(1 for s in segments if s.is_overlap)
+    log.info("✅  Diarization done: %d segments | %d speakers | %d overlap",
+             len(segments), len(unique_speakers), overlap_count)
+    log.info("👥  Speakers: %s", unique_speakers)
 
     return segments
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Alignment – gán từng từ vào người nói
-# ─────────────────────────────────────────────────────────────────────────────
-def _overlap_duration(
-    w_start: float, w_end: float,
-    s_start: float, s_end: float,
+# ===========================================================================
+# SECTION 4 — ALIGNMENT  (word timestamps ↔ speaker segments)
+# ===========================================================================
+
+def _intersection_duration(
+    a_start: float, a_end: float,
+    b_start: float, b_end: float,
 ) -> float:
-    """Tính độ dài overlap (giây) giữa hai khoảng thời gian."""
-    return max(0.0, min(w_end, s_end) - max(w_start, s_start))
+    """Return the length (seconds) of the intersection of two intervals."""
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
 
 
 def align_words_to_speakers(
-    words: List[WordToken],
-    diarization: List[DiarizationSegment],
-) -> List[AlignedSegment]:
+    words:    List[WordStamp],
+    segments: List[SpeakerSegment],
+) -> List[AlignedUtterance]:
     """
-    Thuật toán alignment word-level timestamps ↔ diarization segments.
+    Assign each WordStamp to the SpeakerSegment with the greatest temporal overlap,
+    then merge consecutive same-speaker words into AlignedUtterance objects.
 
-    Chiến lược:
-    1. Mỗi từ được gán cho speaker có THỜI GIAN OVERLAP LỚN NHẤT với từ đó.
-    2. Nếu từ nằm trong vùng overlapped speech, đánh dấu is_overlap=True.
-    3. Gộp các từ liên tiếp của cùng một speaker thành một AlignedSegment.
-    4. Nếu một từ không trùng với bất kỳ speaker nào (khoảng lặng / edge),
-       gán cho speaker của từ liền trước (fallback).
+    Edge cases:
+      - Word falls in a gap between segments → assigned to previous speaker (fallback).
+      - is_overlap flag propagates if ANY word in the merged chunk was in an overlap zone.
     """
     if not words:
         return []
 
-    assigned: List[Tuple[str, bool]] = []   # (speaker, is_overlap) per word
+    fallback_speaker = segments[0].speaker_id if segments else "UNKNOWN"
+    word_assignments: List[Tuple[str, bool]] = []
 
-    last_speaker = diarization[0].speaker if diarization else "UNKNOWN"
-
-    for w in words:
-        best_speaker = None
-        best_overlap = 0.0
+    for word in words:
+        best_speaker    = None
+        best_overlap    = 0.0
         word_is_overlap = False
 
-        for seg in diarization:
-            # Bỏ qua các segment hoàn toàn nằm ngoài cửa sổ từ
-            if seg.end < w.start or seg.start > w.end:
+        for seg in segments:
+            if seg.end_sec <= word.start_sec or seg.start_sec >= word.end_sec:
                 continue
-            ov = _overlap_duration(w.start, w.end, seg.start, seg.end)
-            if ov > best_overlap:
-                best_overlap = ov
-                best_speaker = seg.speaker
+            overlap = _intersection_duration(
+                word.start_sec, word.end_sec,
+                seg.start_sec,  seg.end_sec,
+            )
+            if overlap > best_overlap:
+                best_overlap    = overlap
+                best_speaker    = seg.speaker_id
                 word_is_overlap = seg.is_overlap
 
         if best_speaker is None:
-            # Fallback: dùng speaker của từ trước
-            best_speaker = last_speaker
-            word_is_overlap = False
+            best_speaker = fallback_speaker   # gap fallback: inherit last speaker
 
-        assigned.append((best_speaker, word_is_overlap))
-        last_speaker = best_speaker
+        word_assignments.append((best_speaker, word_is_overlap))
+        fallback_speaker = best_speaker
 
-    # ── Gộp từ liên tiếp của cùng speaker ───────────────────────────────────
-    aligned: List[AlignedSegment] = []
-    current_speaker, current_overlap = assigned[0]
-    current_words: List[WordToken] = [words[0]]
+    # Merge consecutive same-speaker words into utterances
+    utterances: List[AlignedUtterance] = []
+    current_speaker, current_is_overlap = word_assignments[0]
+    current_chunk: List[WordStamp] = [words[0]]
 
     for i in range(1, len(words)):
-        spk, ov = assigned[i]
-        if spk == current_speaker:
-            current_words.append(words[i])
-            current_overlap = current_overlap or ov
+        speaker, is_overlap = word_assignments[i]
+        if speaker == current_speaker:
+            current_chunk.append(words[i])
+            current_is_overlap = current_is_overlap or is_overlap
         else:
-            aligned.append(AlignedSegment(
-                speaker=current_speaker,
-                start=current_words[0].start,
-                end=current_words[-1].end,
-                text="".join(w.word for w in current_words).strip(),
-                is_overlap=current_overlap,
+            utterances.append(AlignedUtterance(
+                speaker_id=current_speaker,
+                start_sec=current_chunk[0].start_sec,
+                end_sec=current_chunk[-1].end_sec,
+                text="".join(w.text for w in current_chunk).strip(),
+                is_overlap=current_is_overlap,
             ))
-            current_speaker = spk
-            current_overlap = ov
-            current_words = [words[i]]
+            current_speaker    = speaker
+            current_is_overlap = is_overlap
+            current_chunk      = [words[i]]
 
-    # Flush đoạn cuối
-    aligned.append(AlignedSegment(
-        speaker=current_speaker,
-        start=current_words[0].start,
-        end=current_words[-1].end,
-        text="".join(w.word for w in current_words).strip(),
-        is_overlap=current_overlap,
+    # Flush the final chunk
+    utterances.append(AlignedUtterance(
+        speaker_id=current_speaker,
+        start_sec=current_chunk[0].start_sec,
+        end_sec=current_chunk[-1].end_sec,
+        text="".join(w.text for w in current_chunk).strip(),
+        is_overlap=current_is_overlap,
     ))
 
-    return aligned
+    return utterances
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Formatting output
-# ─────────────────────────────────────────────────────────────────────────────
-def _fmt_time(seconds: float) -> str:
-    """Chuyển giây → MM:SS (hoặc HH:MM:SS nếu >= 1 giờ)."""
+# ===========================================================================
+# SECTION 5 — OUTPUT FORMATTERS
+# ===========================================================================
+
+def _fmt_ts(seconds: float) -> str:
+    """MM:SS or HH:MM:SS for display in transcript lines."""
     total = int(seconds)
     h, rem = divmod(total, 3600)
     m, s   = divmod(rem, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def format_transcript(aligned: List[AlignedSegment]) -> str:
+def _fmt_ts_ms(seconds: float) -> str:
+    """MM:SS.mmm for millisecond-precision debug output."""
+    m, s = divmod(seconds, 60)
+    return f"{int(m):02d}:{s:06.3f}"
+
+
+def format_final_transcript(utterances: List[AlignedUtterance]) -> str:
     """
-    Định dạng kết quả cuối cùng:
-      [MM:SS - MM:SS] Speaker X: <text>
-    Đoạn overlapped speech được đánh dấu thêm "[OVERLAP]".
+    Produce the human-readable transcript:
+      [MM:SS - MM:SS] SPEAKER_XX: <text>
+    Overlap segments are tagged with [OVERLAP].
     """
     lines = []
-    for seg in aligned:
-        if not seg.text:
+    for utt in utterances:
+        if not utt.text:
             continue
-        overlap_tag = " [OVERLAP]" if seg.is_overlap else ""
+        tag = " [OVERLAP]" if utt.is_overlap else ""
         lines.append(
-            f"[{_fmt_time(seg.start)} - {_fmt_time(seg.end)}] "
-            f"{seg.speaker}{overlap_tag}: {seg.text}"
+            f"[{_fmt_ts(utt.start_sec)} - {_fmt_ts(utt.end_sec)}] "
+            f"{utt.speaker_id}{tag}: {utt.text}"
         )
     return "\n".join(lines)
 
 
-def format_whisper_raw(words: List[WordToken]) -> str:
+def format_whisper_debug(words: List[WordStamp]) -> str:
     """
-    Format kết quả RAW của Whisper (word-level timestamps).
-    Dùng để debug: so sánh với output diarization để kiểm tra alignment.
-
-    Output mẫu:
-      [00:00.120 - 00:00.480]  そう        (p=0.99)
-      [00:00.480 - 00:00.840]  です        (p=0.98)
-      ...
+    Debug view of Whisper output: one word per line with ms timestamps
+    and a confidence bar. Saved to 01_whisper_raw.txt in --debug-dir.
     """
     if not words:
-        return "(Không có từ nào được transcribe)"
-
+        return "(no words transcribed)"
     lines = [
         "=" * 65,
-        "WHISPER RAW OUTPUT — word-level timestamps",
-        f"Tổng số từ: {len(words)}",
+        "WHISPER RAW — word-level timestamps",
+        f"Total words: {len(words)}",
         "=" * 65,
     ]
     for w in words:
-        # Format timestamp đến millisecond
-        def ms(sec: float) -> str:
-            m, s = divmod(sec, 60)
-            return f"{int(m):02d}:{s:06.3f}"
-        prob_bar = "█" * int(w.probability * 10) + "░" * (10 - int(w.probability * 10))
+        bar = "█" * int(w.confidence * 10) + "░" * (10 - int(w.confidence * 10))
         lines.append(
-            f"[{ms(w.start)} → {ms(w.end)}]  "
-            f"{w.word:<20s}  p={w.probability:.2f} {prob_bar}"
+            f"[{_fmt_ts_ms(w.start_sec)} → {_fmt_ts_ms(w.end_sec)}]  "
+            f"{w.text:<20s}  p={w.confidence:.2f}  {bar}"
         )
     return "\n".join(lines)
 
 
-def format_diarization_raw(segments: List[DiarizationSegment]) -> str:
+def format_diarization_debug(segments: List[SpeakerSegment]) -> str:
     """
-    Format kết quả RAW của pyannote diarization.
-    Dùng để debug: xem pipeline phân tách ai nói ở khoảng thời gian nào
-    trước khi matching với Whisper output.
-
-    Output mẫu:
-      [00:00 - 00:05]  SPEAKER_01   (5.00s)
-      [00:05 - 00:08]  SPEAKER_02   (3.00s)  [OVERLAP]
-      ...
+    Debug view of diarization output: per-speaker stats + segment list.
+    Saved to 02_diarization_raw.txt in --debug-dir.
     """
     if not segments:
-        return "(Không có segment nào)"
+        return "(no segments)"
 
-    # Thống kê tổng thời lượng theo speaker
-    speaker_duration: dict = {}
+    speaker_totals: dict = {}
     for seg in segments:
-        d = seg.end - seg.start
-        speaker_duration[seg.speaker] = speaker_duration.get(seg.speaker, 0.0) + d
+        dur = seg.end_sec - seg.start_sec
+        speaker_totals[seg.speaker_id] = speaker_totals.get(seg.speaker_id, 0.0) + dur
 
-    total_duration = max((s.end for s in segments), default=0.0)
-    overlap_count  = sum(1 for s in segments if s.is_overlap)
+    total_dur     = max((s.end_sec for s in segments), default=0.0)
+    overlap_count = sum(1 for s in segments if s.is_overlap)
 
     lines = [
         "=" * 65,
-        "PYANNOTE DIARIZATION RAW OUTPUT",
-        f"Tổng segments  : {len(segments)}",
-        f"Overlap segs   : {overlap_count}",
-        f"Audio duration : {_fmt_time(total_duration)}",
-        f"Speakers       : {sorted(speaker_duration.keys())}",
+        "PYANNOTE DIARIZATION RAW",
+        f"Segments     : {len(segments)}",
+        f"Overlap segs : {overlap_count}",
+        f"Duration     : {_fmt_ts(total_dur)}",
+        f"Speakers     : {sorted(speaker_totals.keys())}",
         "-" * 65,
-        "Thống kê thời lượng mỗi speaker:",
+        "Speaker share:",
     ]
-    for spk, dur in sorted(speaker_duration.items()):
-        pct = dur / total_duration * 100 if total_duration > 0 else 0
+    for spk, dur in sorted(speaker_totals.items()):
+        pct = dur / total_dur * 100 if total_dur else 0
         bar = "█" * int(pct / 5)
         lines.append(f"  {spk:<14s}  {dur:6.1f}s  ({pct:5.1f}%)  {bar}")
 
     lines += [
         "-" * 65,
-        "Chi tiết từng segment:",
-        f"  {'[START - END]':<16}  {'SPEAKER':<14}  {'DUR':>6}  {'OVERLAP':>8}",
+        f"  {'[START - END]':<18}  {'SPEAKER':<14}  {'DUR':>6}  NOTE",
         "  " + "-" * 55,
     ]
     for seg in segments:
-        dur = seg.end - seg.start
-        ov  = "⚠ OVERLAP" if seg.is_overlap else ""
+        dur  = seg.end_sec - seg.start_sec
+        note = "⚠ OVERLAP" if seg.is_overlap else ""
         lines.append(
-            f"  [{_fmt_time(seg.start)} - {_fmt_time(seg.end)}]  "
-            f"{seg.speaker:<14s}  {dur:5.2f}s  {ov}"
+            f"  [{_fmt_ts(seg.start_sec)} - {_fmt_ts(seg.end_sec)}]  "
+            f"{seg.speaker_id:<14s}  {dur:5.2f}s  {note}"
         )
     lines.append("=" * 65)
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Main pipeline
-# ─────────────────────────────────────────────────────────────────────────────
+def save_alignment_debug(
+    words:      List[WordStamp],
+    segments:   List[SpeakerSegment],
+    utterances: List[AlignedUtterance],
+    save_path:  Path,
+) -> None:
+    """
+    Build and save a side-by-side alignment comparison table to save_path.
+
+    Highlights:
+      - Segments with NO matched words (timeline gap issues)
+      - Words that fell outside ALL segments (VAD / boundary mismatch)
+
+    Saved to 04_alignment_debug.txt in --debug-dir.
+    """
+    lines = [
+        "=" * 75,
+        "ALIGNMENT DEBUG",
+        "=" * 75,
+        f"{'DIARIZATION SEGMENT':<38}  WHISPER WORDS",
+        "-" * 75,
+    ]
+
+    for seg in segments:
+        matched = [
+            w for w in words
+            if not (w.end_sec <= seg.start_sec or w.start_sec >= seg.end_sec)
+        ]
+        label = (
+            f"[{_fmt_ts(seg.start_sec)}-{_fmt_ts(seg.end_sec)}] "
+            f"{seg.speaker_id}"
+            + (" ⚠OVL" if seg.is_overlap else "")
+        )
+        if matched:
+            preview = "".join(w.text for w in matched[:8]).strip()
+            if len(matched) > 8:
+                preview += f"… (+{len(matched)-8})"
+            detail = f"({len(matched)} words) {preview}"
+        else:
+            detail = "⚠️  NO WORDS MATCHED — possible timeline gap"
+        lines.append(f"{label:<38}  {detail}")
+
+    unmapped = [
+        w for w in words
+        if not any(
+            not (w.end_sec <= seg.start_sec or w.start_sec >= seg.end_sec)
+            for seg in segments
+        )
+    ]
+    if unmapped:
+        lines += ["", f"⚠️  {len(unmapped)} words outside all segments:"]
+        for w in unmapped[:10]:
+            lines.append(f"   [{_fmt_ts_ms(w.start_sec)}-{_fmt_ts_ms(w.end_sec)}] '{w.text}'")
+        if len(unmapped) > 10:
+            lines.append(f"   ... and {len(unmapped)-10} more")
+
+    lines.append("=" * 75)
+    summary = "\n".join(lines)
+    print("\n" + summary)
+    save_path.write_text(summary, encoding="utf-8")
+    log.info("💾  [DEBUG] Alignment summary → %s", save_path)
+
+
+# ===========================================================================
+# SECTION 6 — PIPELINE ORCHESTRATOR
+# ===========================================================================
+
 def run_pipeline(
-    input_audio:             str,
-    hf_token:                str,
-    language:                str = "ja",
-    initial_prompt:          Optional[str] = None,
-    num_speakers:            Optional[int] = None,
-    min_speakers:            Optional[int] = None,
-    max_speakers:            Optional[int] = None,
-    output_file:             Optional[str] = None,
-    clustering_threshold:    Optional[float] = None,
-    segmentation_threshold:  Optional[float] = None,
-    denoise:                 bool = False,
-    denoise_strength:        float = 0.85,
-    debug_dir:               Optional[str] = None,
+    audio_path:             str,
+    hf_token:               str,
+    language:               str            = "ja",
+    initial_prompt:         Optional[str]  = None,
+    num_speakers:           Optional[int]  = None,
+    min_speakers:           Optional[int]  = None,
+    max_speakers:           Optional[int]  = None,
+    output_file:            Optional[str]  = None,
+    clustering_threshold:   Optional[float] = None,
+    segmentation_threshold: Optional[float] = None,
+    enable_denoise:         bool           = False,
+    denoise_strength:       float          = 0.85,
+    debug_dir:              Optional[str]  = None,
 ) -> str:
     """
-    Pipeline đầy đủ end-to-end:
-      audio file → WAV → [Denoise] → Whisper & Diarization → Alignment → transcript
+    End-to-end orchestrator:
+      audio → WAV 16kHz → [denoise] → Whisper (STT) + pyannote (diarize) → align → transcript
 
-    debug_dir: nếu được truyền vào, pipeline sẽ lưu 2 file intermediate:
-      • {debug_dir}/01_whisper_raw.txt    — word-level timestamps từ Whisper
-      • {debug_dir}/02_diarization_raw.txt — speaker segments từ pyannote
-    Dùng để so sánh 2 kết quả và debug lỗi matching.
+    Split-input design:
+      Whisper  always uses the original WAV for maximum ASR accuracy.
+      pyannote uses the denoised WAV when enable_denoise=True,
+      which improves speaker embedding quality in noisy environments.
+
+    debug_dir: when provided, saves 4 intermediate inspection files:
+      01_whisper_raw.txt      — per-word timestamps from Whisper
+      02_diarization_raw.txt  — speaker segments from pyannote
+      03_final_transcript.txt — aligned transcript
+      04_alignment_debug.txt  — side-by-side comparison table
     """
-    if not Path(input_audio).exists():
-        raise FileNotFoundError(f"File không tồn tại: {input_audio}")
+    if not Path(audio_path).exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    # Tạo debug_dir nếu cần
     debug_path: Optional[Path] = None
     if debug_dir:
         debug_path = Path(debug_dir)
         debug_path.mkdir(parents=True, exist_ok=True)
-        log.info("🐛  Debug mode: intermediate files sẽ lưu vào %s", debug_path)
+        log.info("🐛  Debug mode ON → %s", debug_path)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        wav_path     = str(Path(tmpdir) / "audio_16k.wav")
-        denoise_path = str(Path(tmpdir) / "audio_denoised.wav")
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_path      = str(Path(tmp) / "audio.wav")
+        denoised_path = str(Path(tmp) / "audio_denoised.wav")
 
-        convert_to_wav(input_audio, wav_path)
+        # Step 1: normalise to WAV 16 kHz mono
+        convert_audio_to_wav(audio_path, wav_path)
 
-        if denoise:
-            denoise_wav(wav_path, denoise_path, strength=denoise_strength)
-            diarize_input = denoise_path
-            log.info("🎙  Diarization ← denoised WAV | Whisper ← WAV gốc")
-        else:
-            diarize_input = wav_path
+        # Step 2 (optional): denoise — diarization path only
+        diarize_input = wav_path
+        if enable_denoise:
+            denoise_wav(wav_path, denoised_path, strength=denoise_strength)
+            diarize_input = denoised_path
+            log.info("🎙  Diarize ← denoised  |  Whisper ← original")
 
-        duration = get_audio_duration_seconds(wav_path)
-        log.info("📏  Độ dài audio: %.1f giây (%.1f phút)", duration, duration / 60)
+        duration = probe_audio_duration(wav_path)
+        log.info("📏  Duration: %.1fs (%.1f min)", duration, duration / 60)
 
-        device       = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
-        whisper_model = build_whisper_model(device, compute_type)
+        # Step 3: ASR
+        device        = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type  = "float16" if device == "cuda" else "int8"
+        whisper_model = load_whisper_model(device, compute_type)
 
-        words = transcribe_audio(
-            wav_path         = wav_path,
-            model            = whisper_model,
-            duration_seconds = duration,
-            language         = language,
-            initial_prompt   = initial_prompt,
+        words = transcribe(
+            wav_path=wav_path,
+            model=whisper_model,
+            duration_sec=duration,
+            language=language,
+            initial_prompt=initial_prompt,
         )
 
-        # ── Lưu intermediate file 1: Whisper raw output ──────────────────────
         if debug_path:
-            whisper_raw_file = debug_path / "01_whisper_raw.txt"
-            whisper_raw_file.write_text(format_whisper_raw(words), encoding="utf-8")
-            log.info("💾  [DEBUG] Whisper raw → %s", whisper_raw_file)
+            p = debug_path / "01_whisper_raw.txt"
+            p.write_text(format_whisper_debug(words), encoding="utf-8")
+            log.info("💾  [DEBUG] Whisper raw → %s", p)
 
-        diarization = run_diarization(
-            wav_path               = diarize_input,
-            hf_token               = hf_token,
-            num_speakers           = num_speakers,
-            min_speakers           = min_speakers,
-            max_speakers           = max_speakers,
-            clustering_threshold   = clustering_threshold,
-            segmentation_threshold = segmentation_threshold,
+        # Step 4: Diarization
+        segments = diarize(
+            wav_path=diarize_input,
+            hf_token=hf_token,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            clustering_threshold=clustering_threshold,
+            segmentation_threshold=segmentation_threshold,
         )
 
-        # ── Lưu intermediate file 2: Diarization raw output ─────────────────
         if debug_path:
-            diarize_raw_file = debug_path / "02_diarization_raw.txt"
-            diarize_raw_file.write_text(format_diarization_raw(diarization), encoding="utf-8")
-            log.info("💾  [DEBUG] Diarization raw → %s", diarize_raw_file)
+            p = debug_path / "02_diarization_raw.txt"
+            p.write_text(format_diarization_debug(segments), encoding="utf-8")
+            log.info("💾  [DEBUG] Diarization raw → %s", p)
 
-    log.info("🔗  Đang alignment word-timestamps ↔ speaker segments …")
-    aligned = align_words_to_speakers(words, diarization)
-    log.info("✅  Alignment xong: %d đoạn.", len(aligned))
+    # Step 5: Alignment
+    log.info("🔗  Aligning words to speakers …")
+    utterances = align_words_to_speakers(words, segments)
+    log.info("✅  Alignment done: %d utterances.", len(utterances))
 
-    transcript = format_transcript(aligned)
+    # Step 6: Format & save
+    transcript = format_final_transcript(utterances)
 
     if output_file:
         Path(output_file).write_text(transcript, encoding="utf-8")
-        log.info("💾  Transcript đã lưu: %s", output_file)
+        log.info("💾  Transcript saved → %s", output_file)
 
-    # ── Lưu intermediate file 3: Final aligned transcript (luôn lưu nếu debug) ─
     if debug_path:
-        final_file = debug_path / "03_final_transcript.txt"
-        final_file.write_text(transcript, encoding="utf-8")
-        log.info("💾  [DEBUG] Final transcript → %s", final_file)
-        _print_debug_summary(words, diarization, aligned, debug_path)
+        (debug_path / "03_final_transcript.txt").write_text(transcript, encoding="utf-8")
+        save_alignment_debug(words, segments, utterances, debug_path / "04_alignment_debug.txt")
 
     return transcript
 
 
-def _print_debug_summary(
-    words: List[WordToken],
-    diarization: List[DiarizationSegment],
-    aligned: List[AlignedSegment],
-    debug_path: Path,
-) -> None:
-    """
-    In và lưu bảng tóm tắt alignment để dễ phát hiện lỗi matching.
-    So sánh trực tiếp: diarization timeline vs whisper word timeline.
-    """
-    lines = [
-        "=" * 75,
-        "DEBUG ALIGNMENT SUMMARY",
-        "=" * 75,
-        f"{'DIARIZATION SEGMENTS':<38}  {'WHISPER WORDS (first 3 per segment)'}",
-        "-" * 75,
-    ]
+# ===========================================================================
+# SECTION 7 — DIAGNOSE MODE  (threshold sweep, Whisper-free)
+# ===========================================================================
 
-    for seg in diarization:
-        # Tìm các từ Whisper nằm trong segment này
-        seg_words = [
-            w for w in words
-            if not (w.end <= seg.start or w.start >= seg.end)
-        ]
-
-        seg_label = (
-            f"[{_fmt_time(seg.start)}-{_fmt_time(seg.end)}] "
-            f"{seg.speaker}"
-            f"{' ⚠OVL' if seg.is_overlap else ''}"
-        )
-
-        if seg_words:
-            preview = "".join(w.word for w in seg_words[:8]).strip()
-            if len(seg_words) > 8:
-                preview += f"… (+{len(seg_words)-8} từ)"
-            word_count = f"({len(seg_words)} từ)"
-        else:
-            preview   = "⚠️  KHÔNG CÓ TỪ NÀO MATCH — có thể gap trong timeline"
-            word_count = "(0 từ)"
-
-        lines.append(f"{seg_label:<38}  {word_count} {preview}")
-
-    # Kiểm tra từ không được map vào segment nào
-    unmapped = []
-    for w in words:
-        matched = any(
-            not (w.end <= seg.start or w.start >= seg.end)
-            for seg in diarization
-        )
-        if not matched:
-            unmapped.append(w)
-
-    if unmapped:
-        lines += [
-            "",
-            f"⚠️  {len(unmapped)} TỪ KHÔNG MAP ĐƯỢC vào segment diarization nào:",
-            "   (Nguyên nhân: gap giữa các diarization segment, hoặc Whisper detect âm thanh ngoài vùng nói)",
-        ]
-        for w in unmapped[:10]:
-            def ms(sec: float) -> str:
-                m, s = divmod(sec, 60)
-                return f"{int(m):02d}:{s:05.2f}"
-            lines.append(f"   [{ms(w.start)}-{ms(w.end)}] '{w.word}'")
-        if len(unmapped) > 10:
-            lines.append(f"   ... và {len(unmapped)-10} từ khác")
-
-    lines.append("=" * 75)
-    summary = "\n".join(lines)
-
-    # In ra console
-    print("\n" + summary)
-
-    # Lưu ra file
-    summary_file = debug_path / "04_alignment_debug.txt"
-    summary_file.write_text(summary, encoding="utf-8")
-    log.info("💾  [DEBUG] Alignment summary → %s", summary_file)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. CLI entry point
-# ─────────────────────────────────────────────────────────────────────────────
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Speech-to-Text + Speaker Diarization (Japanese)\n"
-            "faster-whisper large-v3  +  pyannote community-1"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "audio",
-        help="Đường dẫn file audio đầu vào (bất kỳ định dạng ffmpeg hỗ trợ).",
-    )
-    parser.add_argument(
-        "--hf-token",
-        default=os.environ.get("HF_TOKEN", ""),
-        help=(
-            "Hugging Face access token. "
-            "Nếu không truyền, script đọc biến môi trường HF_TOKEN. "
-            "Tạo token tại: https://hf.co/settings/tokens"
-        ),
-    )
-    parser.add_argument(
-        "--language", default="ja",
-        help="Mã ngôn ngữ ISO-639-1 (mặc định: ja).",
-    )
-    parser.add_argument(
-        "--initial-prompt",
-        default=None,
-        help=(
-            "Prompt ngữ cảnh để mồi Whisper nhận diện danh từ riêng / "
-            "từ vựng chuyên ngành. "
-            "Ví dụ: 'トヨタ自動車、ソフトバンク、田中部長'"
-        ),
-    )
-    parser.add_argument(
-        "--num-speakers", type=int, default=None,
-        help="Số người nói chính xác (nếu đã biết trước).",
-    )
-    parser.add_argument(
-        "--min-speakers", type=int, default=None,
-        help="Số người nói tối thiểu.",
-    )
-    parser.add_argument(
-        "--max-speakers", type=int, default=None,
-        help="Số người nói tối đa.",
-    )
-    parser.add_argument(
-        "--output", "-o", default=None,
-        help="Lưu transcript ra file văn bản (UTF-8).",
-    )
-    parser.add_argument(
-        "--denoise", action="store_true",
-        help=(
-            "Bật khử tiếng ồn nền trước khi diarization (dùng noisereduce). "
-            "Khuyến nghị khi audio có nhiễu stationary (văn phòng, quán cà phê) "
-            "hoặc 2 giọng nói gần nhau hay bị nhầm speaker. "
-            "Whisper vẫn dùng audio gốc để giữ chất lượng ASR. "
-            "Cần cài thêm: pip install noisereduce soundfile"
-        ),
-    )
-    parser.add_argument(
-        "--denoise-strength", type=float, default=0.85,
-        help=(
-            "Mức độ khử nhiễu (0.0–1.0, mặc định 0.85). "
-            "0.75–0.85 phù hợp cho hội thoại văn phòng. "
-            "Quá cao (>0.95) có thể làm mất âm vị."
-        ),
-    )
-    parser.add_argument(
-        "--clustering-threshold", type=float, default=None,
-        help=(
-            "Override clustering threshold của pyannote (mặc định ~0.715). "
-            "Tăng lên (0.80-0.90) nếu bị over-segmentation (1 người thành nhiều). "
-            "Giảm xuống (0.55-0.65) nếu bị under-segmentation (nhiều người thành 1)."
-        ),
-    )
-    parser.add_argument(
-        "--segmentation-threshold", type=float, default=None,
-        help=(
-            "Override segmentation threshold (mặc định ~0.817). "
-            "Giảm xuống (0.60-0.75) nếu pipeline bỏ sót nhiều đoạn nói ngắn."
-        ),
-    )
-    parser.add_argument(
-        "--diagnose", action="store_true",
-        help=(
-            "Chế độ chẩn đoán: in hyperparameters hiện tại của pipeline, "
-            "thử nhiều clustering threshold và báo cáo số speaker detected "
-            "mà KHÔNG chạy Whisper. Dùng để tìm threshold phù hợp trước."
-        ),
-    )
-    parser.add_argument(
-        "--debug-dir",
-        default=None,
-        help=(
-            "Lưu các file intermediate để debug alignment. "
-            "Tạo thư mục chứa 4 file:\n"
-            "  01_whisper_raw.txt      — word timestamps từ Whisper\n"
-            "  02_diarization_raw.txt  — speaker segments từ pyannote\n"
-            "  03_final_transcript.txt — transcript đã alignment\n"
-            "  04_alignment_debug.txt  — bảng so sánh để tìm lỗi matching\n"
-            "Ví dụ: --debug-dir ./debug_output"
-        ),
-    )
-    return parser.parse_args()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Diagnostic helper
-# ─────────────────────────────────────────────────────────────────────────────
-def _apply_pipeline_overrides(
-    pipe,
-    clustering_threshold: Optional[float],
-    segmentation_threshold: Optional[float],
-) -> None:
-    """
-    Override hyperparameters của pyannote pipeline sau khi đã load.
-
-    pyannote lưu params dưới dạng lồng nhau, truy cập qua instantiated_parameters.
-    Nếu key không tồn tại (pipeline version khác nhau), log warning và bỏ qua.
-    """
-    try:
-        params = pipe.parameters(instantiated=True)
-        log.info("📐  Hyperparameters hiện tại:\n%s",
-                 "\n".join(f"   {k}: {v}" for k, v in _flatten(params).items()))
-    except Exception:
-        pass
-
-    if clustering_threshold is not None:
-        _set_nested(pipe, ["clustering", "threshold"], clustering_threshold)
-        log.info("🔧  clustering.threshold  → %.3f", clustering_threshold)
-
-    if segmentation_threshold is not None:
-        _set_nested(pipe, ["segmentation", "threshold"], segmentation_threshold)
-        log.info("🔧  segmentation.threshold → %.3f", segmentation_threshold)
-
-
-def _flatten(d: dict, parent: str = "") -> dict:
-    """Flatten nested dict thành {a.b.c: value}."""
-    out = {}
-    for k, v in d.items():
-        key = f"{parent}.{k}" if parent else k
-        if isinstance(v, dict):
-            out.update(_flatten(v, key))
-        else:
-            out[key] = v
-    return out
-
-
-def _set_nested(pipe, path: List[str], value: float) -> None:
-    """
-    Cố gắng set nested param trong pipeline.
-    pyannote lưu params qua instantiated_parameters hoặc trực tiếp trên sub-models.
-    """
-    # Thử qua instantiated_parameters dict
-    try:
-        params = pipe.parameters(instantiated=True)
-        section = path[0]
-        key     = path[1]
-        if section in params and key in params[section]:
-            params[section][key] = value
-            pipe.instantiate(params)
-            return
-    except Exception:
-        pass
-
-    # Thử set trực tiếp qua attribute path trên pipe object
-    try:
-        obj = pipe
-        for attr in path[:-1]:
-            obj = getattr(obj, attr)
-        setattr(obj, path[-1], value)
-        return
-    except Exception:
-        pass
-
-    log.warning("⚠️  Không thể set %s — pipeline version này có thể dùng key khác.", ".".join(path))
-
-
-def run_diagnose(
-    wav_path: str,
-    pipe,
+def run_threshold_sweep(
+    wav_path:     str,
+    pipeline,
     num_speakers: Optional[int],
     min_speakers: Optional[int],
     max_speakers: Optional[int],
 ) -> None:
     """
-    Chế độ chẩn đoán: thử một dải clustering threshold,
-    in số speaker detected ở mỗi mức để người dùng chọn giá trị phù hợp.
+    Sweep clustering thresholds and report detected speaker counts.
+    Does NOT run Whisper — provides fast feedback for threshold tuning.
+    Use before a full pipeline run to find the optimal threshold value.
     """
     print("\n" + "=" * 70)
-    print("🔬  DIAGNOSE MODE — Clustering Threshold Sweep")
+    print("🔬  DIAGNOSE — Clustering Threshold Sweep")
     print("=" * 70)
-    print("Mục tiêu: tìm threshold cho số speaker detected khớp thực tế.")
-    print(f"{'Threshold':>12}  {'Speakers detected':>18}  {'Segments':>10}")
-    print("-" * 46)
+    print(f"{'Threshold':>12}  {'Speakers':>10}  {'Segments':>10}")
+    print("-" * 38)
 
-    diarize_kwargs: dict = {}
+    run_kwargs: dict = {}
     if num_speakers is not None:
-        diarize_kwargs["num_speakers"] = num_speakers
-        print(f"  (num_speakers={num_speakers} được truyền vào → threshold ít ảnh hưởng)")
+        run_kwargs["num_speakers"] = num_speakers
+        print(f"  (num_speakers={num_speakers} fixed — threshold has limited effect)")
     else:
-        if min_speakers: diarize_kwargs["min_speakers"] = min_speakers
-        if max_speakers: diarize_kwargs["max_speakers"] = max_speakers
+        if min_speakers:
+            run_kwargs["min_speakers"] = min_speakers
+        if max_speakers:
+            run_kwargs["max_speakers"] = max_speakers
 
     for threshold in [0.55, 0.60, 0.65, 0.70, 0.715, 0.75, 0.80, 0.85, 0.90]:
-        _set_nested(pipe, ["clustering", "threshold"], threshold)
+        _safe_set_pipeline_param(pipeline, ["clustering", "threshold"], threshold)
         try:
-            out = pipe(wav_path, **diarize_kwargs)
-            speakers = set()
+            out       = pipeline(wav_path, **run_kwargs)
+            speakers  = set()
             seg_count = 0
-            for turn, _, spk in out.exclusive_speaker_diarization.itertracks(yield_label=True):
-                speakers.add(spk)
+            for item in out.exclusive_speaker_diarization.itertracks(yield_label=True):
+                speakers.add(item[-1])
                 seg_count += 1
-            print(f"{threshold:>12.3f}  {len(speakers):>18}  {seg_count:>10}")
-        except Exception as e:
-            print(f"{threshold:>12.3f}  ERROR: {e}")
+            print(f"{threshold:>12.3f}  {len(speakers):>10}  {seg_count:>10}")
+        except Exception as exc:
+            print(f"{threshold:>12.3f}  ERROR: {exc}")
 
     print("=" * 70)
-    print("💡  Gợi ý:")
-    print("   • Nếu số speaker quá nhiều → tăng threshold (0.80+)")
-    print("   • Nếu số speaker quá ít    → giảm threshold (0.60-)")
-    print("   • Sau khi chọn được threshold, chạy lại với --clustering-threshold <value>")
+    print("💡  Too many speakers → raise threshold  |  Too few → lower threshold")
+    print("💡  Then run with: --clustering-threshold <value>")
     print("=" * 70)
+
+
+# ===========================================================================
+# SECTION 8 — CLI
+# ===========================================================================
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="STT + Speaker Diarization (Japanese)\n"
+                    "faster-whisper large-v3  +  pyannote community-1",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument("audio",
+                        help="Input audio/video file (any format ffmpeg supports).")
+
+    parser.add_argument("--hf-token",
+                        default=os.environ.get("HF_TOKEN", ""),
+                        help="HuggingFace read token. Defaults to $HF_TOKEN. "
+                             "Create at: https://hf.co/settings/tokens")
+
+    parser.add_argument("--language", default="ja",
+                        help="ISO-639-1 language code (default: ja).")
+    parser.add_argument("--initial-prompt",
+                        help="Seed Whisper with domain vocabulary. "
+                             "Example: 'トヨタ自動車、ソフトバンク、田中部長'")
+
+    parser.add_argument("--num-speakers",  type=int,
+                        help="Exact speaker count (if known — bypasses clustering).")
+    parser.add_argument("--min-speakers",  type=int, help="Minimum speaker count.")
+    parser.add_argument("--max-speakers",  type=int, help="Maximum speaker count.")
+    parser.add_argument("--clustering-threshold", type=float,
+                        help="Clustering threshold (~0.715 default). "
+                             "Raise → merge over-split; Lower → split under-merged.")
+    parser.add_argument("--segmentation-threshold", type=float,
+                        help="Segmentation threshold (~0.817 default). "
+                             "Lower → capture more short bursts.")
+
+    parser.add_argument("--denoise", action="store_true",
+                        help="Denoise before diarization. "
+                             "Recommended for noisy/office recordings. "
+                             "Requires: pip install noisereduce soundfile")
+    parser.add_argument("--denoise-strength", type=float, default=0.85,
+                        help="Noise reduction strength 0.0–1.0 (default 0.85).")
+
+    parser.add_argument("--output", "-o", help="Save transcript to file (UTF-8).")
+    parser.add_argument("--debug-dir",
+                        help="Save 4 intermediate debug files to this directory.")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Sweep clustering thresholds only — no Whisper. "
+                             "Use to tune diarization before a full run.")
+
+    return parser
 
 
 def main() -> None:
-    args = parse_args()
+    args = build_arg_parser().parse_args()
 
     if not args.hf_token:
         sys.exit(
-            "❌  Hugging Face token chưa được cung cấp.\n"
-            "   Cách 1: export HF_TOKEN='hf_xxx...'\n"
-            "   Cách 2: truyền --hf-token hf_xxx...\n"
-            "   Tạo token tại: https://hf.co/settings/tokens\n"
-            "   Nhớ accept điều khoản model tại:\n"
-            "   https://huggingface.co/pyannote/speaker-diarization-community-1"
+            "❌  HuggingFace token missing.\n"
+            "    Set env var : export HF_TOKEN='hf_xxx'\n"
+            "    Or pass flag: --hf-token hf_xxx\n"
+            "    Create token: https://hf.co/settings/tokens\n"
+            "    Accept model: https://huggingface.co/pyannote/speaker-diarization-community-1"
         )
 
-    # ── Chế độ chẩn đoán (--diagnose): chỉ chạy diarization sweep, không Whisper ──
     if args.diagnose:
-        import tempfile
-        log.info("🔬  Chế độ chẩn đoán được kích hoạt.")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            wav_path = str(Path(tmpdir) / "audio_16k.wav")
-            convert_to_wav(args.audio, wav_path)
-            pipe = PyannotePipeline.from_pretrained(
+        log.info("🔬  Diagnose mode.")
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = str(Path(tmp) / "audio.wav")
+            convert_audio_to_wav(args.audio, wav_path)
+            pipeline = DiarizationPipeline.from_pretrained(
                 DIARIZATION_MODEL_ID, token=args.hf_token
             )
-            device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            pipe = pipe.to(device_obj)
-            run_diagnose(
-                wav_path     = wav_path,
-                pipe         = pipe,
-                num_speakers = args.num_speakers,
-                min_speakers = args.min_speakers,
-                max_speakers = args.max_speakers,
+            pipeline = pipeline.to(
+                torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            )
+            run_threshold_sweep(
+                wav_path=wav_path, pipeline=pipeline,
+                num_speakers=args.num_speakers,
+                min_speakers=args.min_speakers,
+                max_speakers=args.max_speakers,
             )
         return
 
-    # ── Chạy pipeline đầy đủ ─────────────────────────────────────────────────
     transcript = run_pipeline(
-        input_audio            = args.audio,
-        hf_token               = args.hf_token,
-        language               = args.language,
-        initial_prompt         = args.initial_prompt,
-        num_speakers           = args.num_speakers,
-        min_speakers           = args.min_speakers,
-        max_speakers           = args.max_speakers,
-        output_file            = args.output,
-        clustering_threshold   = args.clustering_threshold,
-        segmentation_threshold = args.segmentation_threshold,
-        denoise                = args.denoise,
-        denoise_strength       = args.denoise_strength,
-        debug_dir              = args.debug_dir,
+        audio_path=args.audio,
+        hf_token=args.hf_token,
+        language=args.language,
+        initial_prompt=args.initial_prompt,
+        num_speakers=args.num_speakers,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
+        output_file=args.output,
+        clustering_threshold=args.clustering_threshold,
+        segmentation_threshold=args.segmentation_threshold,
+        enable_denoise=args.denoise,
+        denoise_strength=args.denoise_strength,
+        debug_dir=args.debug_dir,
     )
 
     print("\n" + "=" * 70)
@@ -1151,21 +1003,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# USAGE EXAMPLES
-# ─────────────────────────────────────────────────────────────────────────────
-# Cơ bản:
-#   python stt_diarization.py meeting.mp4 --hf-token hf_xxx
-#
-# Với initial_prompt (danh từ riêng tiếng Nhật):
-#   python stt_diarization.py interview.m4a \
-#       --hf-token hf_xxx \
-#       --initial-prompt "トヨタ自動車、田中一郎部長、ソフトバンクグループ" \
-#       --num-speakers 2 \
-#       --output transcript.txt
-#
-# Dùng biến môi trường:
-#   export HF_TOKEN="hf_xxx"
-#   python stt_diarization.py long_meeting.mp3 --max-speakers 5 -o out.txt
